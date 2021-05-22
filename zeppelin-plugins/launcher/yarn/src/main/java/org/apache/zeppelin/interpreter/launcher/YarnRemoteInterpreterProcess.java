@@ -22,10 +22,8 @@ import com.google.common.io.Files;
 import org.apache.commons.io.FileUtils;
 
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.fs.FileStatus;
-import org.apache.hadoop.fs.FileSystem;
-import org.apache.hadoop.fs.FileUtil;
-import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.fs.*;
+import org.apache.hadoop.fs.permission.FsAction;
 import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.mapreduce.MRJobConfig;
 import org.apache.hadoop.util.StringUtils;
@@ -57,11 +55,7 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.net.MalformedURLException;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Properties;
+import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
@@ -92,8 +86,9 @@ public class YarnRemoteInterpreterProcess extends RemoteInterpreterProcess {
   private Path stagingDir;
 
   // App files are world-wide readable and owner writable -> rw-r--r--
-  private static final FsPermission APP_FILE_PERMISSION =
-          FsPermission.createImmutable(Short.parseShort("644", 8));
+//  private static final FsPermission APP_FILE_PERMISSION =
+//          FsPermission.createImmutable(Short.parseShort("644", 8));
+    private static final FsPermission APP_FILE_PERMISSION = new FsPermission(FsAction.ALL,FsAction.ALL,FsAction.READ_EXECUTE);
 
   public YarnRemoteInterpreterProcess(
           InterpreterLaunchContext launchContext,
@@ -200,11 +195,12 @@ public class YarnRemoteInterpreterProcess extends RemoteInterpreterProcess {
     } catch (Exception e) {
       LOGGER.error("Fail to launch yarn interpreter process", e);
       throw new IOException(e);
-    } finally {
-      if (stagingDir != null) {
-        this.fs.delete(stagingDir, true);
-      }
     }
+   finally {
+     if (stagingDir != null) {
+       this.fs.delete(stagingDir, true);
+     }
+   }
   }
 
   private ApplicationReport getApplicationReport(ApplicationId appId) throws YarnException, IOException {
@@ -237,34 +233,108 @@ public class YarnRemoteInterpreterProcess extends RemoteInterpreterProcess {
     return appContext;
   }
 
+
+  private Path getApplicationDirPath(final Path homeDir, final ApplicationId applicationId) {
+    return new Path(homeDir , ".zeppelinStaging/" + applicationId+ '/');
+//    return new Path(fs.getHomeDirectory() , "/.zeppelinStaging_"+appId.toString());
+  }
+
+  private Path getApplicationDir(final ApplicationId applicationId) throws IOException {
+
+    final Path applicationDir = getApplicationDirPath(fs.getHomeDirectory() , applicationId);
+    if (!fs.exists(applicationDir)) {
+      fs.mkdirs(applicationDir, APP_FILE_PERMISSION);
+      fs.makeQualified(applicationDir);
+      fs.setPermission(applicationDir, APP_FILE_PERMISSION);
+    }
+    return applicationDir;
+  }
+
+  /**
+   * 复制hdfs文件到本地目录
+   * @param remotePath hdfs文件
+   * @param localPath 本地目录
+   * @throws IOException 异常
+   */
+  public void copyFileToLocal(Path remotePath,Path localPath) throws IOException {
+    LOGGER.debug("拷贝"+remotePath.toUri()+"到"+localPath.toUri()+"...");
+    boolean ok = FileUtil.copy(remotePath.getFileSystem(hadoopConf),
+            remotePath,
+            localPath.getFileSystem(hadoopConf),
+            localPath, false, hadoopConf);
+    if(!ok)
+      LOGGER.warn("拷贝"+remotePath.toUri()+"到"+localPath.toUri()+"失败！");
+  }
+
+
   private ContainerLaunchContext setUpAMLaunchContext() throws IOException {
     ContainerLaunchContext amContainer = Records.newRecord(ContainerLaunchContext.class);
-
     // Set the resources to localize
-    this.stagingDir = new Path(fs.getHomeDirectory() + "/.zeppelinStaging", appId.toString());
-    Map<String, LocalResource> localResources = new HashMap<>();
+    //set stagingdir
+    this.stagingDir = getApplicationDir(appId);
 
+    LOGGER.info("default directory: "+fs.getHomeDirectory()+", working directory: "+fs.getWorkingDirectory()+", app dist directory:"+this.stagingDir.toUri());
+    LOGGER.info("localFS directory: "+localFs.getHomeDirectory()+", working directory: "+localFs.getWorkingDirectory());
+
+
+    Map<String, LocalResource> localResources = new HashMap<>();
     File interpreterZip = createInterpreterZip();
-    Path srcPath = localFs.makeQualified(new Path(interpreterZip.toURI()));
+    Path srcPath = new Path(interpreterZip.toURI());
+    srcPath = srcPath.makeQualified(localFs.getUri(),localFs.getWorkingDirectory());
     Path destPath = copyFileToRemote(stagingDir, srcPath, (short) 1);
     addResource(fs, destPath, localResources, LocalResourceType.ARCHIVE, "zeppelin");
-    FileUtils.forceDelete(interpreterZip);
+//    FileUtils.forceDelete(interpreterZip);
 
     // TODO(zjffdu) Should not add interpreter specific logic here.
     if (launchContext.getInterpreterSettingGroup().equals("flink")) {
       File flinkZip = createFlinkZip();
       srcPath = localFs.makeQualified(new Path(flinkZip.toURI()));
+      srcPath = srcPath.makeQualified(localFs.getUri(),localFs.getWorkingDirectory());
       destPath = copyFileToRemote(stagingDir, srcPath, (short) 1);
       addResource(fs, destPath, localResources, LocalResourceType.ARCHIVE, "flink");
-      FileUtils.forceDelete(flinkZip);
+//      FileUtils.forceDelete(flinkZip);
 
+      String hdfsHiveConfDir = launchContext.getProperties().getProperty("HDFS_HIVE_CONF_DIR");
       String hiveConfDir = launchContext.getProperties().getProperty("HIVE_CONF_DIR");
+      FileSystem hdfs ;
+      if (!org.apache.commons.lang3.StringUtils.isBlank(hdfsHiveConfDir)
+//              &&
+//              !org.apache.commons.lang3.StringUtils.isBlank(defaultFs)
+          ) {
+       LOGGER.warn("您配置了HDFS_HIVE_CONF_DIR，此配置会覆盖HIVE_CONF_DIR指定的目录！");
+       File localHiveConfFile = new File(hiveConfDir+File.separator);
+       if(!localHiveConfFile.exists()) localHiveConfFile.mkdir();
+       //hdfs配置文件目录
+        Path hdfsHiveConfPath = new Path(hdfsHiveConfDir);
+        hdfsHiveConfPath.makeQualified(hdfsHiveConfPath.toUri(),fs.getWorkingDirectory());
+        FileSystem remoteFS = hdfsHiveConfPath.getFileSystem(hadoopConf);
+        LOGGER.info("HDFS集群路径："+remoteFS.getUri());
+        LOGGER.info("HIVE HDFS 配置目录："+hdfsHiveConfPath.toUri());
+        //本地配置文件目录
+        Path localHiveConfPath = localFs.makeQualified(new Path(localHiveConfFile.toURI()));
+        localHiveConfPath = localHiveConfPath.makeQualified(localFs.getUri(),localFs.getWorkingDirectory());
+        //递归遍历 拷贝配置文件到本地
+        if(remoteFS.isDirectory(hdfsHiveConfPath)){
+          FileStatus [] subFiles = remoteFS.listStatus(hdfsHiveConfPath) ;
+
+          for(FileStatus subFile : subFiles){
+            LOGGER.info("正在拷贝HIVE配置文件：源路径："+subFile.getPath().toUri()+"，目标路径："+localHiveConfPath.toUri()+"。");
+            copyFileToLocal(subFile.getPath(),localHiveConfPath);
+          }
+        }else{
+          copyFileToLocal(hdfsHiveConfPath,localHiveConfPath);
+        }
+      }
+
+
+
       if (!org.apache.commons.lang3.StringUtils.isBlank(hiveConfDir)) {
         File hiveConfZipFile = createHiveConfZip(new File(hiveConfDir));
         srcPath = localFs.makeQualified(new Path(hiveConfZipFile.toURI()));
         destPath = copyFileToRemote(stagingDir, srcPath, (short) 1);
         addResource(fs, destPath, localResources, LocalResourceType.ARCHIVE, "hive_conf");
       }
+
     }
     amContainer.setLocalResources(localResources);
 
@@ -422,6 +492,8 @@ public class YarnRemoteInterpreterProcess extends RemoteInterpreterProcess {
     }
   }
 
+
+
   /**
    *
    * Create zip file to interpreter.
@@ -430,18 +502,25 @@ public class YarnRemoteInterpreterProcess extends RemoteInterpreterProcess {
    * @throws IOException
    */
   private File createInterpreterZip() throws IOException {
-    File interpreterArchive = File.createTempFile("zeppelin_interpreter_", ".zip", Files.createTempDir());
+    File interpreterArchive = new File("/tmp/zeppelin_interpreter.zip");
+    if(interpreterArchive!=null && interpreterArchive.exists()){
+      interpreterArchive.delete();
+    }
+    interpreterArchive.createNewFile();
+    LOGGER.info("create zeppelin interpeter dir:"+interpreterArchive.getAbsolutePath());
+
     ZipOutputStream interpreterZipStream = new ZipOutputStream(new FileOutputStream(interpreterArchive));
     interpreterZipStream.setLevel(0);
 
     String zeppelinHomeEnv = System.getenv("ZEPPELIN_HOME");
+    LOGGER.info("zeppelin_home:"+zeppelinHomeEnv);
     if (org.apache.commons.lang3.StringUtils.isBlank(zeppelinHomeEnv)) {
       throw new IOException("ZEPPELIN_HOME is not specified");
     }
     File zeppelinHome = new File(zeppelinHomeEnv);
     File binDir = new File(zeppelinHome, "bin");
     addFileToZipStream(interpreterZipStream, binDir, null);
-
+    LOGGER.info("拷贝bin目录到zip包！");
     File confDir = new File(zeppelinHome, "conf");
     addFileToZipStream(interpreterZipStream, confDir, null);
 
@@ -475,7 +554,12 @@ public class YarnRemoteInterpreterProcess extends RemoteInterpreterProcess {
   }
 
   private File createFlinkZip() throws IOException {
-    File flinkArchive = File.createTempFile("flink_", ".zip", Files.createTempDir());
+    File flinkArchive = new File("/tmp/zeppelin_flink.zip");
+    if(flinkArchive!=null && flinkArchive.exists()){
+      flinkArchive.delete();
+    }
+    flinkArchive.createNewFile();
+
     ZipOutputStream flinkZipStream = new ZipOutputStream(new FileOutputStream(flinkArchive));
     flinkZipStream.setLevel(0);
 
@@ -494,14 +578,24 @@ public class YarnRemoteInterpreterProcess extends RemoteInterpreterProcess {
     return flinkArchive;
   }
 
+
+
   private File createHiveConfZip(File hiveConfDir) throws IOException {
-    File hiveConfArchive = File.createTempFile("hive_conf", ".zip", Files.createTempDir());
+    File hiveConfArchive = new File("/tmp/zeppelin_hive_conf.zip");
+    if(hiveConfArchive!=null && hiveConfArchive.exists()){
+      hiveConfArchive.delete();
+    }
+    hiveConfArchive.createNewFile();
+
     ZipOutputStream hiveConfZipStream = new ZipOutputStream(new FileOutputStream(hiveConfArchive));
     hiveConfZipStream.setLevel(0);
 
+    Path hiveHdfsPath = new Path("HIVE_CONF_DIR ");
     if (!hiveConfDir.exists()) {
-      throw new IOException("HIVE_CONF_DIR " + hiveConfDir.getAbsolutePath() + " doesn't exist");
+        throw new IOException("HIVE_CONF_DIR " + hiveConfDir.getAbsolutePath() + " doesn't exist");
     }
+
+
     for (File file : hiveConfDir.listFiles()) {
       addFileToZipStream(hiveConfZipStream, file, null);
     }
@@ -511,16 +605,33 @@ public class YarnRemoteInterpreterProcess extends RemoteInterpreterProcess {
     return hiveConfArchive;
   }
 
-  private Path copyFileToRemote(
-          Path destDir,
+  /**
+   *
+   * @param destDir 目标路径
+   * @param srcPath 源路径
+   * @param replication 副本数
+   * @return
+   * @throws IOException
+   */
+  private Path copyFileToRemote(  Path destDir,
           Path srcPath,
           Short replication) throws IOException {
+    LOGGER.info("文件拷贝：参数：destdir:"+destDir+",srcPath:"+srcPath+",replication:"+replication);
     FileSystem destFs = destDir.getFileSystem(hadoopConf);
     FileSystem srcFs = srcPath.getFileSystem(hadoopConf);
-
     Path destPath = new Path(destDir, srcPath.getName());
+    LOGGER.info("目标HDFS路径："+destPath.toUri());
+    LOGGER.info("源头HDFS路径："+srcPath.toUri());
     LOGGER.info("Uploading resource " + srcPath + " to " + destPath);
-    FileUtil.copy(srcFs, srcPath, destFs, destPath, false, hadoopConf);
+    try {
+      boolean ok = FileUtil.copy(srcFs, srcPath, destFs, destPath, false, hadoopConf);
+      if(ok){
+        LOGGER.info("文件上传成功！！！");
+      }
+    }catch (IOException ex){
+      LOGGER.error("数据上传到hdfs失败！",ex);
+      throw  ex;
+    }
     destFs.setReplication(destPath, replication);
     destFs.setPermission(destPath, APP_FILE_PERMISSION);
 

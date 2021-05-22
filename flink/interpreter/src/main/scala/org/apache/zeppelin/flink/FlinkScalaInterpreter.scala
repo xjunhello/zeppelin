@@ -19,12 +19,11 @@
 package org.apache.zeppelin.flink
 
 import java.io.{BufferedReader, File}
-import java.net.{URL, URLClassLoader}
+import java.net.{MalformedURLException, URL, URLClassLoader}
 import java.nio.file.Files
 import java.util.Properties
 import java.util.concurrent.TimeUnit
 import java.util.jar.JarFile
-
 import org.apache.commons.lang3.StringUtils
 import org.apache.commons.lang3.exception.ExceptionUtils
 import org.apache.flink.api.common.JobExecutionResult
@@ -46,6 +45,8 @@ import org.apache.flink.table.functions.{AggregateFunction, ScalarFunction, Tabl
 import org.apache.flink.table.module.ModuleManager
 import org.apache.flink.table.module.hive.HiveModule
 import org.apache.flink.yarn.cli.FlinkYarnSessionCli
+import org.apache.hadoop.fs.{FileSystem, FileUtil, Path}
+import org.apache.hadoop.yarn.conf.YarnConfiguration
 import org.apache.zeppelin.dep.DependencyResolver
 import org.apache.zeppelin.flink.FlinkShell._
 import org.apache.zeppelin.interpreter.thrift.InterpreterCompletion
@@ -58,6 +59,7 @@ import scala.collection.JavaConverters._
 import scala.tools.nsc.Settings
 import scala.tools.nsc.interpreter.Completion.ScalaCompleter
 import scala.tools.nsc.interpreter.{JPrintWriter, SimpleReader}
+import scala.util.Random
 
 /**
  * It instantiate flink scala shell and create env, senv, btenv, stenv.
@@ -120,7 +122,6 @@ class FlinkScalaInterpreter(val properties: Properties) {
     val modifiers = new java.util.ArrayList[String]()
     modifiers.add("@transient")
     this.bind("z", z.getClass().getCanonicalName(), z, modifiers);
-
     this.jobManager = new JobManager(this.z, jmWebUrl, replacedJMWebUrl, properties)
 
     // register JobListener
@@ -449,12 +450,89 @@ class FlinkScalaInterpreter(val properties: Properties) {
     }
   }
 
-  private def registerHiveCatalog(): Unit = {
-    val hiveConfDir =
-      properties.getOrDefault("HIVE_CONF_DIR", System.getenv("HIVE_CONF_DIR")).toString
-    if (hiveConfDir == null) {
-      throw new InterpreterException("HIVE_CONF_DIR is not specified");
+  private var hadoopConf:YarnConfiguration = new YarnConfiguration()
+  def setHadoopFileSystem(): Unit = {
+
+    // Add core-site.xml and yarn-site.xml. This is for integration test where using MiniHadoopCluster.
+    if (properties.containsKey("HADOOP_CONF_DIR") && !org.apache.commons.lang3.StringUtils.isBlank(properties.getProperty("HADOOP_CONF_DIR"))) {
+      val hadoopConfDir = new File(properties.getProperty("HADOOP_CONF_DIR"))
+      if (hadoopConfDir.exists && hadoopConfDir.isDirectory) {
+        val coreSite = new File(hadoopConfDir, "core-site.xml")
+        try this.hadoopConf.addResource(coreSite.toURI.toURL)
+        catch {
+          case e: MalformedURLException =>
+            LOGGER.warn("Fail to add core-site.xml: " + coreSite.getAbsolutePath, e)
+        }
+        val yarnSite = new File(hadoopConfDir, "yarn-site.xml")
+        try this.hadoopConf.addResource(yarnSite.toURI.toURL)
+        catch {
+          case e: MalformedURLException =>
+            LOGGER.warn("Fail to add yarn-site.xml: " + yarnSite.getAbsolutePath, e)
+        }
+      }
+      else throw new RuntimeException("HADOOP_CONF_DIR: " + hadoopConfDir.getAbsolutePath + " doesn't exist or is not a directory")
     }
+  }
+  /**
+   * 复制hdfs文件到本地目录
+   *
+   * @param remotePath hdfs文件
+   * @param localPath  本地目录
+   * @throws IOException 异常
+   */
+
+  def copyFileToLocal(remotePath: Path, localPath: Path): Unit = {
+    LOGGER.debug("拷贝" + remotePath.toUri + "到" + localPath.toUri + "...")
+    val ok = FileUtil.copy(remotePath.getFileSystem(hadoopConf), remotePath, localPath.getFileSystem(hadoopConf), localPath, false, hadoopConf)
+    if (!ok) LOGGER.warn("拷贝" + remotePath.toUri + "到" + localPath.toUri + "失败！")
+  }
+
+
+  private def registerHiveCatalog(): Unit = {
+    setHadoopFileSystem()
+    val hdfsHiveConfDir: String = properties.getProperty("HDFS_HIVE_CONF_DIR")
+    var hiveConfDir =
+      properties.getOrDefault("HIVE_CONF_DIR", System.getenv("HIVE_CONF_DIR")).toString
+
+
+    if (!org.apache.commons.lang3.StringUtils.isBlank(hdfsHiveConfDir)
+    //              &&
+    //              !org.apache.commons.lang3.StringUtils.isBlank(defaultFs)
+    ) {
+      LOGGER.warn("您配置了HDFS_HIVE_CONF_DIR，此配置会覆盖HIVE_CONF_DIR指定的目录！");
+
+      //hdfs配置文件目录
+      var hdfsHiveConfPath = new Path(hdfsHiveConfDir);
+      var fs = FileSystem.get(hadoopConf)
+      hdfsHiveConfPath.makeQualified(hdfsHiveConfPath.toUri(), fs.getWorkingDirectory());
+      val remoteFS = hdfsHiveConfPath.getFileSystem(hadoopConf);
+
+      //本地配置文件目录
+      val tempHiveConfDir = "/tmp/hive_conf_" + new Random().nextInt(6)
+      val tempHiveConfFile = new File(tempHiveConfDir);
+      if (tempHiveConfFile.exists())
+        tempHiveConfFile.delete()
+      else
+        tempHiveConfFile.mkdir()
+
+      val localFs = FileSystem.getLocal(hadoopConf)
+
+      var localHiveConfPath = localFs.makeQualified(new Path(tempHiveConfFile.toURI()));
+      localHiveConfPath = localHiveConfPath.makeQualified(localFs.getUri(), localFs.getWorkingDirectory());
+      //递归遍历 拷贝配置文件到本地
+      if (remoteFS.isDirectory(hdfsHiveConfPath)) {
+        remoteFS.listStatus(hdfsHiveConfPath).foreach { subFile =>
+          copyFileToLocal(subFile.getPath(), localHiveConfPath);
+        }
+      } else copyFileToLocal(hdfsHiveConfPath, localHiveConfPath)
+
+      hiveConfDir = tempHiveConfDir;
+    }else{
+      if (hiveConfDir == null) {
+        throw new InterpreterException("HIVE_CONF_DIR is not specified");
+      }
+    }
+
     val database = properties.getProperty("zeppelin.flink.hive.database", "default")
     val hiveVersion = properties.getProperty("zeppelin.flink.hive.version", "2.3.4")
     val hiveCatalog = new HiveCatalog("hive", database, hiveConfDir, hiveVersion)
@@ -649,36 +727,63 @@ class FlinkScalaInterpreter(val properties: Properties) {
    * @param context
    */
   def setSavepointPathIfNecessary(context: InterpreterContext): Unit = {
-    val savepointPath = context.getConfig.getOrDefault(JobManager.SAVEPOINT_PATH, "").toString
-    val resumeFromSavepoint = context.getBooleanLocalProperty(JobManager.RESUME_FROM_SAVEPOINT, false)
+    val testSavePointFromAPI = context.getConfig.getOrDefault(JobManager.SAVEPOINT_PATH, "").toString
+    val testResumeFromLatestCheckpoint=context.getBooleanLocalProperty(JobManager.RESUME_FROM_CHECKPOINT, false)
+    val testResumeFromSavepoint= context.getBooleanLocalProperty(JobManager.RESUME_FROM_SAVEPOINT, false)
+    val testCheckpointPathFromAPI = context.getConfig.getOrDefault(JobManager.LATEST_CHECKPOINT_PATH, "").toString
+    val exeSavePointContext = context.getConfig.getOrDefault(SavepointConfigOptions.SAVEPOINT_PATH.key(), "")
+    val exeSavePointUser = context.getLocalProperties.getOrDefault(SavepointConfigOptions.SAVEPOINT_PATH.key(), "")
+    val testResumeFromSavepointUser = context.getLocalProperties.getOrDefault(JobManager.RESUME_FROM_CHECKPOINT, "")
+    val testResumeFromLatestCheckpointUser = context.getLocalProperties.getOrDefault(JobManager.RESUME_FROM_CHECKPOINT, "")
+    LOGGER.info(
+      s"""
+        |--------------------------------------savepoint path setting----------------------------------------------
+        |savepoint_path= ${testSavePointFromAPI}
+        |resumeFromLatestCheckpoint= ${testResumeFromLatestCheckpoint}
+        |latest_checkpoint_path= ${testCheckpointPathFromAPI}
+        |resumeFromSavepoint= ${testResumeFromSavepoint}
+        |context execution.savepoint.path = ${exeSavePointContext}
+        |user execution.savepoint.path = ${exeSavePointUser}
+        |user resumeFromLatestCheckpoint = ${testResumeFromLatestCheckpointUser}
+        |user resumeFromSavepoint = ${testResumeFromSavepointUser}
+        |-------------------------------------savepoint path setting-----------------------------------------------
+        |""".stripMargin)
+    LOGGER.info("setSavepointPathIfNecessary");
+    val savepointPath = context.getConfig.getOrDefault(JobManager.SAVEPOINT_PATH, "").toString //api 的savepoint_path
+    LOGGER.info("savepoint_path:"++savepointPath);
+    val resumeFromSavepoint = context.getBooleanLocalProperty(JobManager.RESUME_FROM_SAVEPOINT, false) //%flink.conf的resumeFromSavepoint true/false
+    LOGGER.info("resumeFromSavepoint:"+resumeFromSavepoint);
     // flink 1.12 use copied version of configuration, so in order to update configuration we have to
     // get the internal configuration of StreamExecutionEnvironment.
     val internalConfiguration = getConfigurationOfStreamExecutionEnv()
-    if (!StringUtils.isBlank(savepointPath) && resumeFromSavepoint){
-      LOGGER.info("Resume job from savepoint , savepointPath = {}", savepointPath)
+    if (!StringUtils.isBlank(savepointPath) && resumeFromSavepoint){ //如果%flink.conf的resumeFromSavepoint=true && rest api 的 上一次savepoint_path 不为空 ， 则从savepoint_path恢复
+      LOGGER.info("resumeFromSavepoint = true && Resume job from savepoint , savepointPath = {}", savepointPath)
       internalConfiguration.setString(SavepointConfigOptions.SAVEPOINT_PATH.key(), savepointPath);
       return
     }
 
     val checkpointPath = context.getConfig.getOrDefault(JobManager.LATEST_CHECKPOINT_PATH, "").toString
     val resumeFromLatestCheckpoint = context.getBooleanLocalProperty(JobManager.RESUME_FROM_CHECKPOINT, false)
-    if (!StringUtils.isBlank(checkpointPath) && resumeFromLatestCheckpoint) {
-      LOGGER.info("Resume job from checkpoint , checkpointPath = {}", checkpointPath)
+    if (!StringUtils.isBlank(checkpointPath) && resumeFromLatestCheckpoint) {//如果 restapi 的latest_checkpoint_path不为空 且 %flink_conf 的resumeFromLatestCheckpoint=true 则 从latest_checkpoint_path恢复
+      LOGGER.info("resumeFromLatestCheckpoint=true && Resume job from checkpoint , checkpointPath = {}", checkpointPath)
       internalConfiguration.setString(SavepointConfigOptions.SAVEPOINT_PATH.key(), checkpointPath);
       return
     }
 
     val userSavepointPath = context.getLocalProperties.getOrDefault(
       SavepointConfigOptions.SAVEPOINT_PATH.key(), "")
-    if (!StringUtils.isBlank(userSavepointPath)) {
-      LOGGER.info("Resume job from user set savepoint , savepointPath = {}", userSavepointPath)
-      internalConfiguration.setString(SavepointConfigOptions.SAVEPOINT_PATH.key(), checkpointPath)
+    if (!StringUtils.isBlank(userSavepointPath)) {//如果%flink.conf 的 execution.savepoint.path 不为空，则从latest_checkpoint_path恢复
+
+      LOGGER.info("execution.savepoint.path is not null && Resume job from user set savepoint , savepointPath = {}", userSavepointPath)
+      LOGGER.info("execution.savepoint.path :"+userSavepointPath+"       ,latest_checkpoint_path:"+checkpointPath)
+      internalConfiguration.setString(SavepointConfigOptions.SAVEPOINT_PATH.key(), userSavepointPath)
       return;
     }
 
     val userSettingSavepointPath = properties.getProperty(SavepointConfigOptions.SAVEPOINT_PATH.key())
-    if (StringUtils.isBlank(userSettingSavepointPath)) {
+    if (StringUtils.isBlank(userSettingSavepointPath)) {//如果job配置的execution.savepoint.path为空，则不恢复
       // remove SAVEPOINT_PATH when user didn't set it via %flink.conf
+      LOGGER.info("delete savepoint ")
       internalConfiguration.removeConfig(SavepointConfigOptions.SAVEPOINT_PATH)
     }
   }
